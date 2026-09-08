@@ -27,6 +27,40 @@ const PORT = process.env.PORT || 3001;
 // Archivos de persistencia local
 const QUEUE_FILE = path.join(AUTH_DIR, "message_queue.json");
 const PROCESSED_IDS_FILE = path.join(AUTH_DIR, "processed_message_ids.json");
+const SETTINGS_FILE = path.join(AUTH_DIR, "bridge_settings.json");
+
+const DEFAULT_SETTINGS = {
+  modoAvion: false,
+  localCerrado: false,
+  mensajeCerrado:
+    "¡Hola! En este momento Wan Sushi se encuentra cerrado 🍣.\nNuestro horario de atención es de Martes a Domingo de 17:00 a 23:00 hrs.\nApenas abramos te responderemos con gusto.",
+};
+
+function loadSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const data = fs.readFileSync(SETTINGS_FILE, "utf-8");
+      const parsed = JSON.parse(data);
+      return { ...DEFAULT_SETTINGS, ...parsed };
+    }
+  } catch (e) {
+    console.error("[WhatsApp Bridge] Error cargando configuración del puente:", e.message);
+  }
+  return { ...DEFAULT_SETTINGS };
+}
+
+let bridgeSettings = loadSettings();
+
+function saveSettings(settings) {
+  try {
+    if (!fs.existsSync(AUTH_DIR)) {
+      fs.mkdirSync(AUTH_DIR, { recursive: true });
+    }
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf-8");
+  } catch (e) {
+    console.error("[WhatsApp Bridge] Error guardando configuración del puente:", e.message);
+  }
+}
 
 // Cargar cola persistente desde disco
 function loadQueue() {
@@ -104,7 +138,7 @@ const lidPhoneMap = new Map();
 // Estado de la sesión en memoria
 let sessionState = {
   bridgeOnline: true,
-  estado: "desconectado", // "desconectado" | "qr_listo" | "conectado" | "conectando"
+  estado: bridgeSettings.modoAvion ? "modo_avion" : "desconectado", // "desconectado" | "qr_listo" | "conectado" | "conectando" | "modo_avion"
   qrString: "",
   telefonoVinculado: "",
   nombreDispositivo: "",
@@ -378,8 +412,61 @@ async function resolveFacebookPicture(queryStr) {
   return null;
 }
 
+// Cache anti-spam para auto-respuesta de local cerrado (evita spam si el cliente envía varios mensajes seguidos)
+const autoReplyThrottleMap = new Map(); // key (teléfono/jid) -> timestamp
+
+async function handleClosedStoreAutoReply(targetJid, senderName, realPhone) {
+  if (!bridgeSettings.localCerrado) return;
+  if (!waSocket || sessionState.estado !== "conectado") return;
+
+  const key = realPhone || targetJid;
+  const now = Date.now();
+  const lastSent = autoReplyThrottleMap.get(key) || 0;
+  // No enviar más de 1 auto-respuesta cada 2 horas al mismo contacto
+  if (now - lastSent < 2 * 60 * 60 * 1000) {
+    console.log(`[WhatsApp Bridge] ⏳ Auto-respuesta omitida por anti-spam para ${senderName} (${key})`);
+    return;
+  }
+  autoReplyThrottleMap.set(key, now);
+
+  const replyText = (bridgeSettings.mensajeCerrado || DEFAULT_SETTINGS.mensajeCerrado).trim();
+  if (!replyText) return;
+
+  console.log(`[WhatsApp Bridge] 🌙 Enviando auto-respuesta de local cerrado a ${senderName} (${key})...`);
+
+  try {
+    const sentMsg = await waSocket.sendMessage(targetJid, { text: replyText });
+    if (sentMsg?.key?.id) {
+      markMessageProcessed(sentMsg.key.id);
+    }
+
+    messageQueue.push({
+      msgId: sentMsg?.key?.id || `auto_${Date.now()}`,
+      jid: targetJid,
+      remitenteId: (realPhone || "").replace(/\D/g, "") || targetJid,
+      nombreCliente: "Negocio (Auto-Respuesta)",
+      mensaje: replyText,
+      telefono: realPhone || "",
+      fotoPerfil: "",
+      fecha: new Date().toISOString(),
+      fromMe: true,
+      esAutoRespuesta: true,
+    });
+    if (messageQueue.length > 100) messageQueue.shift();
+    saveQueue(messageQueue);
+    console.log(`[WhatsApp Bridge] ✅ Auto-respuesta enviada con éxito a ${senderName}`);
+  } catch (err) {
+    console.error(`[WhatsApp Bridge] Error enviando auto-respuesta:`, err.message);
+  }
+}
+
 // Iniciar y gestionar el Socket de WhatsApp Web (Baileys)
 async function startWhatsAppSocket() {
+  if (bridgeSettings.modoAvion) {
+    console.log("[WhatsApp Bridge] ✈️ Modo Avión activo. Socket de WhatsApp suspendido.");
+    sessionState.estado = "modo_avion";
+    return;
+  }
   if (isInitializing) return;
   isInitializing = true;
 
@@ -443,6 +530,12 @@ async function startWhatsAppSocket() {
       }
 
       if (connection === "close") {
+        if (bridgeSettings.modoAvion) {
+          console.log("[WhatsApp Bridge] ✈️ Conexión suspendida intencionalmente por Modo Avión.");
+          sessionState.estado = "modo_avion";
+          return;
+        }
+
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -610,6 +703,20 @@ async function startWhatsAppSocket() {
         messageQueue.shift();
       }
       saveQueue(messageQueue);
+
+      // Auto-respuesta 24/7 si el local está cerrado (solo a mensajes en vivo "notify", de clientes, no grupos, no estados)
+      if (
+        bridgeSettings.localCerrado &&
+        !isFromMe &&
+        originType === "notify" &&
+        rawJid &&
+        !rawJid.endsWith("@g.us") &&
+        !rawJid.includes("broadcast")
+      ) {
+        handleClosedStoreAutoReply(rawJid, senderName, realPhone).catch((err) => {
+          console.error("[WhatsApp Bridge] Error en auto-respuesta de local cerrado:", err.message);
+        });
+      }
     };
 
     // 1. Escuchar mensajes entrantes (tanto en vivo "notify" como recuperados al reconectar "append")
@@ -660,8 +767,71 @@ const server = http.createServer(async (req, res) => {
       JSON.stringify({
         ...sessionState,
         pendingCount: messageQueue.length,
+        settings: bridgeSettings,
       })
     );
+    return;
+  }
+
+  // Endpoint: GET /bridge-settings
+  if (req.method === "GET" && url.startsWith("/bridge-settings")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        success: true,
+        settings: bridgeSettings,
+        estado: sessionState.estado,
+      })
+    );
+    return;
+  }
+
+  // Endpoint: POST /bridge-settings (actualiza modo avión, local cerrado o mensaje)
+  if (req.method === "POST" && url.startsWith("/bridge-settings")) {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      try {
+        const data = JSON.parse(body || "{}");
+        const prevModoAvion = bridgeSettings.modoAvion;
+
+        if (typeof data.modoAvion === "boolean") bridgeSettings.modoAvion = data.modoAvion;
+        if (typeof data.localCerrado === "boolean") bridgeSettings.localCerrado = data.localCerrado;
+        if (typeof data.mensajeCerrado === "string") bridgeSettings.mensajeCerrado = data.mensajeCerrado;
+
+        saveSettings(bridgeSettings);
+        console.log("[WhatsApp Bridge] ⚙️ Configuración actualizada:", bridgeSettings);
+
+        // Transición de Modo Avión
+        if (bridgeSettings.modoAvion && !prevModoAvion) {
+          console.log("[WhatsApp Bridge] ✈️ Activando Modo Avión: desconectando socket de WhatsApp...");
+          sessionState.estado = "modo_avion";
+          if (waSocket) {
+            try {
+              waSocket.end();
+            } catch (e) {}
+            waSocket = null;
+          }
+        } else if (!bridgeSettings.modoAvion && prevModoAvion) {
+          console.log("[WhatsApp Bridge] ✈️ Desactivando Modo Avión: reconectando socket de WhatsApp...");
+          sessionState.estado = "desconectado";
+          startWhatsAppSocket();
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            success: true,
+            settings: bridgeSettings,
+            estado: sessionState.estado,
+          })
+        );
+      } catch (err) {
+        console.error("[WhatsApp Bridge] Error guardando configuración:", err.message);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
     return;
   }
 
