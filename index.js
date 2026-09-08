@@ -465,6 +465,7 @@ async function handleClosedStoreAutoReply(targetJid, senderName, realPhone) {
       fecha: new Date().toISOString(),
       fromMe: true,
       esAutoRespuesta: true,
+      status: "enviado",
     });
     if (messageQueue.length > 100) messageQueue.shift();
     saveQueue(messageQueue);
@@ -756,7 +757,33 @@ async function startWhatsAppSocket() {
       }
     });
 
-    // 3. Escuchar confirmaciones de estado de entrega y lectura de WhatsApp (Palomitas reales)
+    // Helper unificado para emitir confirmaciones de estado (recibos / palomitas de WhatsApp)
+    const emitMessageReceipt = async (keyId, remoteJid, statusName) => {
+      if (!keyId || !statusName) return;
+      const rawJid = remoteJid || "";
+      let realPhone = "";
+      try {
+        realPhone = await resolvePhoneNumber(rawJid);
+      } catch {}
+      const cleanPhone = realPhone ? realPhone.replace(/\D/g, "") : (rawJid ? rawJid.replace(/@.+/, "").replace(/\D/g, "") : "");
+
+      console.log(`[WhatsApp Bridge] 👁️ RECIBO de mensaje ${keyId} (${rawJid} / ${realPhone || cleanPhone}): "${statusName}"`);
+
+      messageQueue.push({
+        tipo: "recibo",
+        msgId: keyId,
+        jid: rawJid,
+        remitenteId: cleanPhone || rawJid,
+        telefono: realPhone || "",
+        status: statusName,
+        fecha: new Date().toISOString(),
+      });
+
+      if (messageQueue.length > 100) messageQueue.shift();
+      saveQueue(messageQueue);
+    };
+
+    // 3. Escuchar confirmaciones de estado de entrega y lectura de WhatsApp (Palomitas vía messages.update)
     waSocket.ev.on("messages.update", async (updates) => {
       for (const update of updates) {
         const { key, update: msgUpdate } = update;
@@ -769,23 +796,31 @@ async function startWhatsAppSocket() {
         // 5 = PLAYED (audio escuchado)
         const rawStatus = msgUpdate.status;
         let statusName = null;
-        if (rawStatus === 2) statusName = "enviado";
-        else if (rawStatus === 3) statusName = "entregado";
-        else if (rawStatus === 4 || rawStatus === 5) statusName = "leido";
+        if (rawStatus === 2 || rawStatus === "SERVER_ACK") statusName = "enviado";
+        else if (rawStatus === 3 || rawStatus === "DELIVERY_ACK") statusName = "entregado";
+        else if (rawStatus === 4 || rawStatus === 5 || rawStatus === "READ" || rawStatus === "PLAYED") statusName = "leido";
 
         if (statusName) {
-          console.log(`[WhatsApp Bridge] 👁️ RECIBO de mensaje ${key.id} (${key.remoteJid}): "${statusName}"`);
+          await emitMessageReceipt(key.id, key.remoteJid, statusName);
+        }
+      }
+    });
 
-          messageQueue.push({
-            tipo: "recibo",
-            msgId: key.id,
-            jid: key.remoteJid || "",
-            status: statusName,
-            fecha: new Date().toISOString(),
-          });
+    // 4. Escuchar confirmaciones granulares de entrega y lectura de WhatsApp (Palomitas vía message-receipt.update)
+    waSocket.ev.on("message-receipt.update", async (receiptUpdates) => {
+      for (const item of receiptUpdates) {
+        const { key, receipt } = item || {};
+        if (!key || !key.id || !receipt) continue;
 
-          if (messageQueue.length > 100) messageQueue.shift();
-          saveQueue(messageQueue);
+        let statusName = null;
+        if (receipt.readTimestamp || receipt.playedTimestamp) {
+          statusName = "leido";
+        } else if (receipt.receiptTimestamp) {
+          statusName = "entregado";
+        }
+
+        if (statusName) {
+          await emitMessageReceipt(key.id, key.remoteJid, statusName);
         }
       }
     });
