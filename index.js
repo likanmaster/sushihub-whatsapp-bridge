@@ -755,6 +755,40 @@ async function startWhatsAppSocket() {
         }
       }
     });
+
+    // 3. Escuchar confirmaciones de estado de entrega y lectura de WhatsApp (Palomitas reales)
+    waSocket.ev.on("messages.update", async (updates) => {
+      for (const update of updates) {
+        const { key, update: msgUpdate } = update;
+        if (!key || !key.id || !msgUpdate) continue;
+
+        // Mapeo oficial de estados de Baileys / WhatsApp:
+        // 2 = SERVER_ACK (1 check: entregado al servidor de WhatsApp)
+        // 3 = DELIVERY_ACK (2 checks: entregado al teléfono del cliente)
+        // 4 = READ (2 checks azules: visto/leído por el cliente)
+        // 5 = PLAYED (audio escuchado)
+        const rawStatus = msgUpdate.status;
+        let statusName = null;
+        if (rawStatus === 2) statusName = "enviado";
+        else if (rawStatus === 3) statusName = "entregado";
+        else if (rawStatus === 4 || rawStatus === 5) statusName = "leido";
+
+        if (statusName) {
+          console.log(`[WhatsApp Bridge] 👁️ RECIBO de mensaje ${key.id} (${key.remoteJid}): "${statusName}"`);
+
+          messageQueue.push({
+            tipo: "recibo",
+            msgId: key.id,
+            jid: key.remoteJid || "",
+            status: statusName,
+            fecha: new Date().toISOString(),
+          });
+
+          if (messageQueue.length > 100) messageQueue.shift();
+          saveQueue(messageQueue);
+        }
+      }
+    });
   } catch (err) {
     console.error("[WhatsApp Bridge] Error inicializando socket:", err);
     sessionState.estado = "desconectado";
