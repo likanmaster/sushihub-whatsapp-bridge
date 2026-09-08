@@ -432,18 +432,32 @@ async function handleClosedStoreAutoReply(targetJid, senderName, realPhone) {
   const replyText = (bridgeSettings.mensajeCerrado || DEFAULT_SETTINGS.mensajeCerrado).trim();
   if (!replyText) return;
 
-  console.log(`[WhatsApp Bridge] 🌙 Enviando auto-respuesta de local cerrado a ${senderName} (${key})...`);
+  // Resolver JID óptimo para envío (si viene como LID o número, asegurar dominio correcto)
+  let finalJid = targetJid;
+  const cleanPhone = (realPhone || "").replace(/\D/g, "");
+  if (cleanPhone && cleanPhone.length >= 8 && cleanPhone.length <= 15) {
+    finalJid = `${cleanPhone}@s.whatsapp.net`;
+  } else if (targetJid && !targetJid.includes("@")) {
+    const clean = targetJid.replace(/\D/g, "");
+    if (jidMap.has(clean)) {
+      finalJid = jidMap.get(clean);
+    } else {
+      finalJid = `${clean}@s.whatsapp.net`;
+    }
+  }
+
+  console.log(`[WhatsApp Bridge] 🌙 Enviando auto-respuesta de local cerrado a ${senderName} (${finalJid})...`);
 
   try {
-    const sentMsg = await waSocket.sendMessage(targetJid, { text: replyText });
+    const sentMsg = await waSocket.sendMessage(finalJid, { text: replyText });
     if (sentMsg?.key?.id) {
       markMessageProcessed(sentMsg.key.id);
     }
 
     messageQueue.push({
       msgId: sentMsg?.key?.id || `auto_${Date.now()}`,
-      jid: targetJid,
-      remitenteId: (realPhone || "").replace(/\D/g, "") || targetJid,
+      jid: finalJid,
+      remitenteId: cleanPhone || targetJid,
       nombreCliente: "Negocio (Auto-Respuesta)",
       mensaje: replyText,
       telefono: realPhone || "",
@@ -454,9 +468,14 @@ async function handleClosedStoreAutoReply(targetJid, senderName, realPhone) {
     });
     if (messageQueue.length > 100) messageQueue.shift();
     saveQueue(messageQueue);
-    console.log(`[WhatsApp Bridge] ✅ Auto-respuesta enviada con éxito a ${senderName}`);
+    console.log(`[WhatsApp Bridge] ✅ Auto-respuesta enviada con éxito a ${senderName} (${finalJid})`);
   } catch (err) {
-    console.error(`[WhatsApp Bridge] Error enviando auto-respuesta:`, err.message);
+    console.error(`[WhatsApp Bridge] Error enviando auto-respuesta a ${finalJid}:`, err.message);
+    if (finalJid !== targetJid) {
+      try {
+        await waSocket.sendMessage(targetJid, { text: replyText });
+      } catch (e2) {}
+    }
   }
 }
 
@@ -1082,7 +1101,7 @@ const server = http.createServer(async (req, res) => {
   res.end(
     JSON.stringify({
       app: "SushiHub WhatsApp Multi-Device Bridge",
-      version: "2.1.0",
+      version: "2.2.0",
       estado: sessionState.estado,
       telefonoVinculado: sessionState.telefonoVinculado,
     })
