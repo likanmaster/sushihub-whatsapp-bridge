@@ -1,0 +1,18 @@
+﻿{
+  "name": "sushihub-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp Multi-Device QR Bridge for SushiHub",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
