@@ -477,8 +477,6 @@ async function startWhatsAppSocket() {
     // Función unificada para procesar mensajes entrantes (en vivo y recuperados offline)
     const processIncomingMessage = async (msg, originType = "notify") => {
       if (!msg || !msg.key) return;
-      // Ignorar mensajes enviados por nosotros o estados
-      if (msg.key.fromMe) return;
       if (msg.key.remoteJid === "status@broadcast") return;
       if (!msg.message) return;
 
@@ -487,7 +485,9 @@ async function startWhatsAppSocket() {
         return; // Ya procesado, evitar duplicados
       }
 
-      // Manejar reacciones a mensajes entrantes (❤️, 👍, 😂, etc.)
+      const isFromMe = Boolean(msg.key.fromMe);
+
+      // Manejar reacciones a mensajes (❤️, 👍, 😂, etc.)
       if (msg.message.reactionMessage) {
         const react = msg.message.reactionMessage;
         const targetMsgId = react.key?.id;
@@ -496,11 +496,11 @@ async function startWhatsAppSocket() {
         const realPhone = await resolvePhoneNumber(rawJid, msg);
         const cleanPhone = realPhone ? realPhone.replace(/\D/g, "") : "";
         const cleanLid = rawJid.replace(/@.+/, "").replace(/\D/g, "");
-        const senderName = msg.pushName || (realPhone ? `Cliente WhatsApp (${realPhone})` : "Cliente WhatsApp");
+        const senderName = isFromMe ? "Negocio (Celular)" : (msg.pushName || (realPhone ? `Cliente WhatsApp (${realPhone})` : "Cliente WhatsApp"));
 
         console.log(`---------------------------------------------------------`);
-        console.log(`[WhatsApp Bridge] ❤️ REACCIÓN RECIBIDA: "${emoji || "QUITADA"}" en mensaje ${targetMsgId}`);
-        console.log(`  De:       ${senderName}`);
+        console.log(`[WhatsApp Bridge] ❤️ REACCIÓN ${isFromMe ? "ENVIADA DESDE CELULAR" : "RECIBIDA"}: "${emoji || "QUITADA"}" en mensaje ${targetMsgId}`);
+        console.log(`  De/Para:  ${senderName}`);
         console.log(`---------------------------------------------------------`);
 
         if (msgId) markMessageProcessed(msgId);
@@ -515,6 +515,7 @@ async function startWhatsAppSocket() {
           nombreCliente: senderName,
           telefono: realPhone || "",
           fecha: new Date().toISOString(),
+          fromMe: isFromMe,
         });
 
         if (messageQueue.length > 100) {
@@ -537,8 +538,8 @@ async function startWhatsAppSocket() {
         return;
       }
 
-      // Extraer texto del mensaje
-      const text =
+      // Extraer texto del mensaje o etiqueta de archivo multimedia
+      let text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         msg.message.imageMessage?.caption ||
@@ -546,7 +547,16 @@ async function startWhatsAppSocket() {
         msg.message.videoMessage?.caption ||
         "";
 
-      if (!text.trim()) return;
+      if (!text.trim()) {
+        if (msg.message.imageMessage) text = "📷 [Foto/Imagen]";
+        else if (msg.message.audioMessage) text = "🎵 [Nota de voz/Audio]";
+        else if (msg.message.videoMessage) text = "🎥 [Video]";
+        else if (msg.message.documentMessage) text = "📄 [Documento]";
+        else if (msg.message.stickerMessage) text = "🎨 [Sticker]";
+        else if (msg.message.locationMessage) text = "📍 [Ubicación]";
+        else if (msg.message.contactMessage) text = "👤 [Contacto]";
+        else return;
+      }
 
       if (msgId) markMessageProcessed(msgId);
 
@@ -555,7 +565,9 @@ async function startWhatsAppSocket() {
       const cleanPhone = realPhone ? realPhone.replace(/\D/g, "") : "";
       const cleanLid = rawJid.replace(/@.+/, "").replace(/\D/g, "");
 
-      const senderName = msg.pushName || (realPhone ? `Cliente WhatsApp (${realPhone})` : "Cliente WhatsApp");
+      const senderName = isFromMe
+        ? "Negocio (Celular)"
+        : (msg.pushName || (realPhone ? `Cliente WhatsApp (${realPhone})` : "Cliente WhatsApp"));
 
       // Registrar en el mapa de JIDs para que responder siempre apunte al chat exacto
       jidMap.set(rawJid, rawJid);
@@ -570,12 +582,12 @@ async function startWhatsAppSocket() {
         if (participantClean) jidMap.set(participantClean, rawJid);
       }
 
-      const fotoPerfil = await getProfilePicture(rawJid, realPhone);
+      const fotoPerfil = isFromMe ? "" : await getProfilePicture(rawJid, realPhone);
       const isOffline = originType === "append" || originType === "history";
 
       console.log(`---------------------------------------------------------`);
-      console.log(`[WhatsApp Bridge] 💬 MENSAJE RECIBIDO (${isOffline ? "RECUPERADO OFFLINE / RECONEXIÓN" : "EN VIVO"}):`);
-      console.log(`  De:       ${senderName}`);
+      console.log(`[WhatsApp Bridge] 💬 MENSAJE ${isFromMe ? "ENVIADO DESDE CELULAR" : "RECIBIDO"} (${isOffline ? "RECUPERADO OFFLINE" : "EN VIVO"}):`);
+      console.log(`  De/Para:  ${senderName}`);
       console.log(`  Teléfono: ${realPhone || "(No disponible)"}`);
       console.log(`  Foto:     ${fotoPerfil ? "✅ Disponible" : "❌ Sin foto / Privada"}`);
       console.log(`  Fecha:    ${msgDate.toLocaleString()}`);
@@ -591,6 +603,7 @@ async function startWhatsAppSocket() {
         telefono: realPhone || "",
         fotoPerfil: fotoPerfil || "",
         fecha: msgDate.toISOString(),
+        fromMe: isFromMe,
       });
 
       if (messageQueue.length > 100) {
@@ -803,27 +816,34 @@ const server = http.createServer(async (req, res) => {
           const captionText = text || caption || "";
           console.log(`[WhatsApp Bridge] 📤 Enviando imagen a JID real: "${targetJid}" (caption: "${captionText}")`);
 
+          let sentMsg = null;
           if (imgBuffer) {
-            await waSocket.sendMessage(targetJid, {
+            sentMsg = await waSocket.sendMessage(targetJid, {
               image: imgBuffer,
               caption: captionText,
             });
           } else if (isUrl) {
-            await waSocket.sendMessage(targetJid, {
+            sentMsg = await waSocket.sendMessage(targetJid, {
               image: { url: image },
               caption: captionText,
             });
           }
+          if (sentMsg?.key?.id) {
+            markMessageProcessed(sentMsg.key.id);
+          }
           console.log(`[WhatsApp Bridge] ✅ Imagen entregada exitosamente al socket de WhatsApp`);
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, targetJid, type: "image", caption: captionText }));
+          res.end(JSON.stringify({ success: true, targetJid, type: "image", caption: captionText, msgId: sentMsg?.key?.id }));
         } else {
           console.log(`[WhatsApp Bridge] 📤 Enviando mensaje a JID real: "${targetJid}": "${text}"`);
-          await waSocket.sendMessage(targetJid, { text });
+          const sentMsg = await waSocket.sendMessage(targetJid, { text });
+          if (sentMsg?.key?.id) {
+            markMessageProcessed(sentMsg.key.id);
+          }
           console.log(`[WhatsApp Bridge] ✅ Mensaje entregado exitosamente al socket de WhatsApp`);
 
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, targetJid, text, type: "text" }));
+          res.end(JSON.stringify({ success: true, targetJid, text, type: "text", msgId: sentMsg?.key?.id }));
         }
       } catch (err) {
         console.error("[WhatsApp Bridge] Error enviando mensaje:", err);
